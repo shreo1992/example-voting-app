@@ -99,7 +99,64 @@ jobs:
 
               browser.close()
           PY
+      - name: Create temporary application URLs
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            --output /tmp/cloudflared
+          chmod +x /tmp/cloudflared
 
+          nohup /tmp/cloudflared tunnel \
+            --url http://localhost:8080 \
+            --no-autoupdate \
+            > /tmp/vote-tunnel.log 2>&1 &
+
+          nohup /tmp/cloudflared tunnel \
+            --url http://localhost:8081 \
+            --no-autoupdate \
+            > /tmp/result-tunnel.log 2>&1 &
+
+          VOTE_URL=""
+          RESULT_URL=""
+
+          for attempt in $(seq 1 60); do
+            VOTE_URL=$(grep -oE \
+              'https://[a-z0-9-]+\.trycloudflare\.com' \
+              /tmp/vote-tunnel.log | head -n 1 || true)
+
+            RESULT_URL=$(grep -oE \
+              'https://[a-z0-9-]+\.trycloudflare\.com' \
+              /tmp/result-tunnel.log | head -n 1 || true)
+
+            if [ -n "$VOTE_URL" ] && [ -n "$RESULT_URL" ]; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$VOTE_URL" ] || [ -z "$RESULT_URL" ]; then
+            cat /tmp/vote-tunnel.log /tmp/result-tunnel.log
+            exit 1
+          fi
+
+          echo "VOTING PAGE: $VOTE_URL"
+          echo "RESULTS PAGE: $RESULT_URL"
+
+          {
+            echo "## Live application preview"
+            echo "[Open voting page]($VOTE_URL)"
+            echo ""
+            echo "[Open results page]($RESULT_URL)"
+            echo ""
+            echo "Available during the 15-minute preview step."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep application available for 15 minutes
+        run: |
+          echo "Open the URLs printed in the previous step."
+          echo "Submit votes and watch the results update."
+          sleep 900
       - name: Collect logs
         if: always()
         run: |
