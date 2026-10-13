@@ -1,0 +1,203 @@
+name: Full Stack Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - ci/full-stack-test-new
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v7
+
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+
+      - name: Build application images
+        run: docker compose build vote result worker
+
+      - name: Start all five services
+        run: |
+          docker compose up -d --wait --wait-timeout 180 \
+            vote result worker redis db
+          docker compose ps
+
+      - name: Check application pages
+        run: |
+          curl --fail --retry 20 --retry-delay 3 \
+            --retry-all-errors http://localhost:8080/
+          curl --fail --retry 20 --retry-delay 3 \
+            --retry-all-errors http://localhost:8081/
+
+      - name: Submit a test vote
+        run: |
+          curl --fail --show-error \
+            --cookie "voter_id=github-actions-test" \
+            --data "vote=a" \
+            http://localhost:8080/
+
+      - name: Verify vote reached PostgreSQL
+        run: |
+          for attempt in $(seq 1 30); do
+            VOTE=$(docker compose exec -T db \
+              psql -U postgres -d postgres -tAc \
+              "SELECT vote FROM votes WHERE id='github-actions-test';" \
+              2>/dev/null || true)
+
+            if [ "$VOTE" = "a" ]; then
+              echo "PASS: Vote → Redis → Worker → PostgreSQL"
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          echo "FAIL: Vote did not reach PostgreSQL"
+          exit 1
+
+      - name: Capture application screenshots
+        run: |
+          mkdir -p test-artifacts
+          python3 -m venv /tmp/browser-test
+          /tmp/browser-test/bin/pip install playwright==1.55.0
+          /tmp/browser-test/bin/playwright install --with-deps chromium
+
+          /tmp/browser-test/bin/python <<'PY'
+          from playwright.sync_api import sync_playwright, expect
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page(
+                  viewport={"width": 1280, "height": 800}
+              )
+
+              page.goto("http://localhost:8080/")
+              page.screenshot(
+                  path="test-artifacts/vote.png",
+                  full_page=True
+              )
+
+              page.goto("http://localhost:8081/")
+              expect(page.locator("#result")).to_have_text(
+                  "1 vote", timeout=60000
+              )
+              expect(page.locator(".cats .stat")).to_have_text(
+                  "100.0%", timeout=15000
+              )
+              page.screenshot(
+                  path="test-artifacts/result.png",
+                  full_page=True
+              )
+
+              browser.close()
+          PY
+      - name: Create temporary application URLs
+        if: github.event_name != 'pull_request'
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            --output /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+
+          nohup /tmp/cloudflared tunnel \
+            --url http://localhost:8080 \
+            --no-autoupdate \
+            > /tmp/vote-tunnel.log 2>&1 &
+
+          nohup /tmp/cloudflared tunnel \
+            --url http://localhost:8081 \
+            --no-autoupdate \
+            > /tmp/result-tunnel.log 2>&1 &
+
+          VOTE_URL=""
+          RESULT_URL=""
+
+          for attempt in $(seq 1 60); do
+            VOTE_URL=$(grep -oE \
+              'https://[a-z0-9-]+\.trycloudflare\.com' \
+              /tmp/vote-tunnel.log | head -n 1 || true)
+
+            RESULT_URL=$(grep -oE \
+              'https://[a-z0-9-]+\.trycloudflare\.com' \
+              /tmp/result-tunnel.log | head -n 1 || true)
+
+            if [ -n "$VOTE_URL" ] && [ -n "$RESULT_URL" ]; then
+              break
+            fi
+
+            sleep 2
+          done
+
+          if [ -z "$VOTE_URL" ] || [ -z "$RESULT_URL" ]; then
+            cat /tmp/vote-tunnel.log /tmp/result-tunnel.log
+            exit 1
+          fi
+
+          echo "VOTING PAGE: $VOTE_URL"
+          echo "RESULTS PAGE: $RESULT_URL"
+
+          {
+            echo "## Live application preview"
+            echo "[Open voting page]($VOTE_URL)"
+            echo ""
+            echo "[Open results page]($RESULT_URL)"
+            echo ""
+            echo "Available during the 15-minute preview step."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep application available for 15 minutes
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "Open the URLs printed in the previous step."
+          echo "Submit votes and watch the results update."
+          sleep 900
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p test-artifacts
+          docker compose ps --all > test-artifacts/services.txt
+          docker compose logs --no-color > test-artifacts/compose.log 2>&1
+
+      - name: Upload screenshots and logs
+        id: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: voting-app-test
+          path: test-artifacts/
+          retention-days: 7
+
+      - name: Show test summary
+        if: always()
+        env:
+          STATUS: ${{ job.status }}
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          {
+            echo "## Voting application test"
+            echo "Status: **$STATUS**"
+            echo ""
+            echo "Services: Vote, Result, Worker, Redis, PostgreSQL."
+            echo ""
+            echo "[Download screenshots and logs]($ARTIFACT_URL)"
+            echo ""
+            echo "Open vote.png and result.png to see the application."
+            echo "Push and manual runs include a temporary 15-minute public preview."
+            echo "Pull request runs test the application without opening public tunnels."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up
+        if: always()
+        run: docker compose down --volumes --remove-orphans
